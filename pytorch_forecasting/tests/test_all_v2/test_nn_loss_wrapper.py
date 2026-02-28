@@ -158,3 +158,38 @@ class TestNNLossWrapperBasic:
         assert mse_wrapper._num_batches.item() == before, (
             "loss() should not update the running accumulator"
         )
+
+    # ---- user requested tests --------------------------------------------------
+
+    def test_forward_calls_loss_once(self):
+        class CountLoss(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def forward(self, x, y):
+                self.calls += 1
+                return torch.mean((x - y) ** 2)
+
+        cnt = CountLoss()
+        wrapper = NNLossWrapper(cnt)
+
+        y_pred = torch.randn(4, 6)
+        y_true = torch.randn(4, 6)
+
+        wrapper(y_pred, y_true)
+
+        assert cnt.calls == 1
+
+    def test_forward_device_alignment(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+        wrapper = NNLossWrapper(nn.MSELoss())
+
+        y_pred = torch.randn(4, 6).cuda()
+        y_true = torch.randn(4, 6)  # CPU
+
+        loss = wrapper(y_pred, y_true)
+
+        assert loss.device == y_pred.device

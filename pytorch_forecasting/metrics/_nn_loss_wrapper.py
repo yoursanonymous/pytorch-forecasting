@@ -93,7 +93,7 @@ class NNLossWrapper(Metric):
 
         y_pred = self.to_prediction(y_pred)
         # Align shapes: broadcast target to match y_pred if needed
-        target = target.to(dtype=y_pred.dtype)
+        target = target.to(dtype=y_pred.dtype, device=y_pred.device)
 
         batch_loss = self.loss_fn(y_pred, target)
         self._total_loss += batch_loss.detach()
@@ -102,7 +102,7 @@ class NNLossWrapper(Metric):
     def compute(self) -> torch.Tensor:
         """Return mean loss over all accumulated batches."""
         if self._num_batches == 0:
-            return torch.tensor(0.0)
+            return self._total_loss.new_tensor(0.0)
         return self._total_loss / self._num_batches
 
     @torch.jit.unused
@@ -128,13 +128,14 @@ class NNLossWrapper(Metric):
             target = target[0]
 
         y_pred_point = self.to_prediction(y_pred)
-        target = target.to(dtype=y_pred_point.dtype)
+        target = target.to(dtype=y_pred_point.dtype, device=y_pred_point.device)
 
         # Update internal accumulator state once per batch
-        self._total_loss += self.loss_fn(y_pred_point, target).detach()
+        loss_val = self.loss_fn(y_pred_point, target)
+        self._total_loss += loss_val.detach()
         self._num_batches += 1
 
-        return self.loss_fn(y_pred_point, target)
+        return loss_val
 
     def loss(self, y_pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
         """Delegate to the wrapped ``nn.Module`` loss.
@@ -160,7 +161,8 @@ class NNLossWrapper(Metric):
         if isinstance(target, (tuple, list)):
             target = target[0]
         y_pred_point = self.to_prediction(y_pred)
-        return self.loss_fn(y_pred_point, target.to(dtype=y_pred_point.dtype))
+        target = target.to(dtype=y_pred_point.dtype, device=y_pred_point.device)
+        return self.loss_fn(y_pred_point, target)
 
     # ------------------------------------------------------------------
     # Prediction conversion helpers

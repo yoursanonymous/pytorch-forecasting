@@ -1,7 +1,9 @@
+import logging
 from pathlib import Path
 import pickle
 from typing import Any, Optional, Union
 
+import pandas as pd
 from lightning import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.core.datamodule import LightningDataModule
@@ -51,7 +53,6 @@ class Base_pkg(_BasePtForecasterV2):
         self.model_cfg = self._load_config(
             model_cfg, ckpt_path=self.ckpt_path, auto_file_name="model_cfg.pkl"
         )
-        print(self.model_cfg)
 
         self.datamodule_cfg = self._load_config(
             datamodule_cfg,
@@ -67,7 +68,6 @@ class Base_pkg(_BasePtForecasterV2):
         self.trainer = None
         self.datamodule = None
         if self.ckpt_path:
-            print(self.metadata)
             self._build_model(metadata=self.metadata, **self.model_cfg)
         else:
             self.model = None
@@ -97,7 +97,6 @@ class Base_pkg(_BasePtForecasterV2):
             raise FileNotFoundError(f"Configuration file not found: {path}")
 
         suffix = path.suffix.lower()
-        print(suffix)
 
         if suffix in [".yaml", ".yml"]:
             with open(path) as f:
@@ -157,9 +156,34 @@ class Base_pkg(_BasePtForecasterV2):
         return datamodule_cls(data, **self.datamodule_cfg)
 
     def _load_dataloader(
-        self, data: TimeSeries | LightningDataModule | DataLoader
+        self, data: "pd.DataFrame | TimeSeries | LightningDataModule | DataLoader"
     ) -> DataLoader:
-        """Converts various data input types into a DataLoader for prediction."""
+        """Convert various data input types into a DataLoader for prediction.
+
+        Parameters
+        ----------
+        data : pd.DataFrame, TimeSeries, LightningDataModule, or DataLoader
+            - ``pd.DataFrame``: automatically wrapped in a :class:`TimeSeries`
+              using the ``time``, ``target``, and ``group`` fields from
+              ``datamodule_cfg``, then passed through the D2 layer.
+            - ``TimeSeries`` (D1): a DataModule is built and ``predict`` stage
+              is set up.
+            - ``LightningDataModule`` (D2): ``predict`` stage is set up directly.
+            - ``DataLoader``: used as-is.
+        """
+        if isinstance(data, pd.DataFrame):
+            # Auto-build a TimeSeries from the DataFrame using datamodule_cfg metadata.
+            # Keys that map to TimeSeries constructor args are extracted; the rest
+            # remain in datamodule_cfg for the DataModule.
+            ts_arg_keys = {"time", "target", "group", "weight", "num", "cat",
+                           "known", "unknown", "static", "data_future"}
+            ts_kwargs = {
+                k: v for k, v in self.datamodule_cfg.items() if k in ts_arg_keys
+            }
+            from pytorch_forecasting.data import TimeSeries  # local import to avoid circularity
+            data = TimeSeries(data=data, **ts_kwargs)
+            # fall through to the TimeSeries branch below
+
         if isinstance(data, TimeSeries):  # D1 Layer
             dm = self._build_datamodule(data)
             dm.setup(stage="predict")
@@ -172,7 +196,7 @@ class Base_pkg(_BasePtForecasterV2):
         else:
             raise TypeError(
                 f"Unsupported data type for prediction: {type(data).__name__}. "
-                "Expected TimeSeriesDataSet, LightningDataModule, or DataLoader."
+                "Expected pd.DataFrame, TimeSeries, LightningDataModule, or DataLoader."
             )
 
     def _save_artifact(self, output_dir: Path):
@@ -259,36 +283,47 @@ class Base_pkg(_BasePtForecasterV2):
         if save_ckpt and checkpoint_cb:
             best_model_path = Path(checkpoint_cb.best_model_path)
             self._save_artifact(best_model_path.parent)
-            print(f"Artifacts saved in: {best_model_path.parent}")
+            logging.info("Artifacts saved in: %s", best_model_path.parent)
             return best_model_path
         return None
 
     def predict(
         self,
-        data: TimeSeries | LightningDataModule | DataLoader,
+        data: "pd.DataFrame | TimeSeries | LightningDataModule | DataLoader",
         output_dir: str | Path | None = None,
+        inverse_transform: bool = False,
         **kwargs,
-    ) -> dict[str, torch.Tensor] | None:
-        """
-        Generate predictions by wrapping the model's predict method.
+    ) -> "dict[str, torch.Tensor] | None":
+        """Generate predictions by wrapping the model's predict method.
 
         This method prepares the data by resolving it into a DataLoader and then
         delegates the prediction task to the underlying model's ``.predict()`` method.
 
         Parameters
         ----------
-        data : Union[TimeSeries, LightningDataModule, DataLoader]
-            The data to predict on (D1, D2, or DataLoader).
+        data : pd.DataFrame, TimeSeries, LightningDataModule, or DataLoader
+            The data to predict on.  A raw ``pd.DataFrame`` is automatically
+            converted to a :class:`~pytorch_forecasting.data.TimeSeries` using
+            the ``time``, ``target``, and ``group`` fields found in
+            ``datamodule_cfg`` (if those keys are present).
+        output_dir : str or Path, optional
+            If provided, predictions are serialised to ``predictions.pkl``
+            inside this directory and ``None`` is returned instead.
+        inverse_transform : bool, default=False
+            If ``True`` **and** a fitted datamodule with a target normalizer
+            is attached to this package (i.e. ``fit()`` has been called),
+            the raw predictions are inverse-transformed back to the original
+            target scale before returning.
         **kwargs :
-            Additional keyword arguments passed directly to the model's ``.predict()``
-            method. This includes `mode`, `return_info`, `output_dir`, and any
-            `trainer_kwargs`.
+            Additional keyword arguments passed directly to the model's
+            ``.predict()`` method (e.g. ``mode``, ``return_info``,
+            ``trainer_kwargs``).
 
         Returns
         -------
-        Union[Dict[str, torch.Tensor], None]
-            A dictionary of prediction tensors, or `None` if `output_dir` is specified
-            in `**kwargs`.
+        dict[str, torch.Tensor] or None
+            A dictionary of prediction tensors, or ``None`` if *output_dir*
+            is specified.
         """
         if self.model is None:
             raise RuntimeError(
@@ -298,13 +333,22 @@ class Base_pkg(_BasePtForecasterV2):
         dataloader = self._load_dataloader(data)
         predictions = self.model.predict(dataloader, **kwargs)
 
+        # Optionally inverse-transform from normalized to original scale
+        if inverse_transform and self.datamodule is not None and hasattr(
+            self.datamodule, "inverse_transform_predictions"
+        ):
+            pred_tensor = predictions.get("prediction")
+            if pred_tensor is not None:
+                predictions["prediction"] = (
+                    self.datamodule.inverse_transform_predictions(pred_tensor)
+                )
+
         if output_dir:
             output_path = Path(output_dir)
             output_path.mkdir(parents=True, exist_ok=True)
             output_file = output_path / "predictions.pkl"
             with open(output_file, "wb") as f:
                 pickle.dump(predictions, f)
-            print(f"Predictions saved to {output_file}")
             return None
 
         return predictions

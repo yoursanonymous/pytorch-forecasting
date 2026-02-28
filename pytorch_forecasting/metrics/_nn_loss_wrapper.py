@@ -29,6 +29,12 @@ class NNLossWrapper(Metric):
     native :class:`~pytorch_forecasting.metrics.Metric` instances in v2
     :class:`~pytorch_forecasting.models.base.BaseModel` subclasses.
 
+    .. note::
+        The wrapper automatically aligns the `device` and `dtype` of the target
+        tensors to match the prediction tensors before passing them to the
+        underlying ``loss_fn``. This prevents device mismatch runtime errors
+        (e.g. GPU predictions vs CPU targets).
+
     Parameters
     ----------
     loss_fn : nn.Module
